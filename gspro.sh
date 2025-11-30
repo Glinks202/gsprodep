@@ -1,4 +1,7 @@
 #!/bin/bash
+if ! declare -f green >/dev/null 2>&1; then green(){  echo -e "\033[1;32m$*\033[0m"; }; fi
+if ! declare -f yellow >/dev/null 2>&1; then yellow(){ echo -e "\033[1;33m$*\033[0m"; }; fi
+if ! declare -f red   >/dev/null 2>&1; then red(){    echo -e "\033[1;31m$*\033[0m"; }; fi
 ##########################################################################
 # GS-PRO — 全自动云基础设施部署脚本（含断点恢复）
 # Version: FINAL-2025-STABLE
@@ -73,17 +76,57 @@ PW_BILLING="862444"
 
 ok "基础变量加载完成"
 
+# —— 安全清理 Docker 的函数（解决 overlayfs busy）——
+safe_clean_docker() {
+  echo "[清理] 开始安全清理 Docker/Containerd ..."
+
+  # 1) 停容器并清理资源（多次执行也安全）
+  docker ps -aq | xargs -r docker rm -f 2>/dev/null || true
+  docker system prune -a --volumes -f 2>/dev/null || true
+
+  # 2) 停守护进程
+  systemctl stop docker docker.socket containerd 2>/dev/null || true
+  pkill -9 dockerd containerd containerd-shim runc 2>/dev/null || true
+
+  # 3) 卸载 /var/lib/docker 下所有挂载点（避免 Device or resource busy）
+  mounts="$(mount | awk '/\/var\/lib\/docker/ {print $3}')"
+  if [ -n "$mounts" ]; then
+    echo "[清理] 卸载挂载点："
+    echo "$mounts" | sed 's/^/  - /'
+    while read -r m; do
+      umount -lf "$m" 2>/dev/null || true
+    done <<< "$mounts"
+  fi
+
+  # 4) 删除数据目录
+  rm -rf /var/lib/docker /var/lib/containerd /etc/docker 2>/dev/null || true
+
+  # 5) 重载并尝试恢复服务（如果后面步骤要重装，也无妨）
+  systemctl daemon-reload
+  systemctl start containerd 2>/dev/null || true
+  systemctl start docker 2>/dev/null || true
+
+  if docker info >/dev/null 2>&1; then
+    echo "[清理] Docker 状态：可用"
+  else
+    echo "[清理] Docker 状态：未就绪（后续安装步骤会覆盖修复）"
+  fi
+}
 ##########################################################################
 # Step 1 — 清理旧环境
 ##########################################################################
 step 1 "清理旧环境：Docker / Apache / 旧反代" || true
 
+# Apache 清理（保留你原有逻辑）
 systemctl stop apache2 >/dev/null 2>&1 || true
 systemctl disable apache2 >/dev/null 2>&1 || true
-apt remove -y apache2* >/dev/null 2>&1 || true
+apt remove -y 'apache2*' >/dev/null 2>&1 || true
 
+# 旧 Docker 包卸载（这行保留也没问题）
 apt remove -y docker docker.io docker-engine containerd runc >/dev/null 2>&1 || true
-rm -rf /var/lib/docker /var/lib/containerd /etc/docker
+
+# 关键：用“安全清理”替代直接 rm -rf，避免 overlayfs busy
+safe_clean_docker
 
 ok "旧环境清理完成（安全）"
 
