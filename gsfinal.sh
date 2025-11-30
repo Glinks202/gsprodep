@@ -51,7 +51,7 @@ green(){ echo -e "\033[1;32m$*\033[0m"; }
 yellow(){ echo -e "\033[1;33m$*\033[0m"; }
 red(){ echo -e "\033[1;31m$*\033[0m"; }
 
-# 记录日志
+# 记录日志（stdout+stderr）
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 #======================== 断点恢复机制 ========================#
@@ -84,10 +84,10 @@ apt_quiet() { DEBIAN_FRONTEND=noninteractive apt-get -yq "$@" ; }
 
 wait_for_port_free() {
   local p=$1
-  if ss -tulpn | grep -q ":$p\b"; then
+  if ss -tulpn | grep -q ":$p\\b"; then
     yellow "端口 $p 被占用，尝试释放..."
     local pids
-    pids="$(ss -tulpn | awk -v P=":$p" '$0 ~ P {print $NF}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
+    pids="$(ss -tulpn | awk -v P=":$p" '$0 ~ P {print $NF}' | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | sort -u)"
     if [[ -n "${pids}" ]]; then
       for pid in $pids; do kill -9 "$pid" || true; done
       sleep 1
@@ -97,7 +97,7 @@ wait_for_port_free() {
 
 wait_for_http() {
   # wait_for_http URL code timeout_seconds
-  local url="$1" need="${2:-200}" timeout="${3:-120}" t=0
+  local url="$1" need="${2:-200}" timeout="${3:-180}" t=0
   while (( t < timeout )); do
     code="$(curl -sk -o /dev/null -w '%{http_code}' "$url" || true)"
     [[ "$code" == "$need" ]] && return 0
@@ -118,7 +118,7 @@ json_or_empty() {
 
 ensure_base_tools() {
   apt_quiet update
-  apt_quiet install -y curl jq dnsutils ca-certificates gnupg lsb-release
+  apt_quiet install -y curl jq dnsutils ca-certificates gnupg lsb-release software-properties-common ufw
 }
 
 #======================== 步骤 0：基础系统检查 ========================#
@@ -131,26 +131,22 @@ if step 0 "基础环境检查与准备"; then
 fi
 
 #======================== 步骤 1：清理旧环境 ========================#
-if step 1 "清理旧环境：Docker/Apache/旧反代/冲突端口"; then
-  systemctl stop apache2 nginx >/dev/null 2>&1 || true
-  systemctl disable apache2 nginx >/dev/null 2>&1 || true
+if step 1 "清理旧环境：Docker/Apache/Nginx/冲突端口"; then
+  systemctl stop apache2 nginx docker containerd >/dev/null 2>&1 || true
+  systemctl disable apache2 nginx docker containerd >/dev/null 2>&1 || true
   apt_quiet remove -y apache2* nginx* || true
 
-  # 停老容器，避免 /var/lib/docker 忙碌
   if command -v docker >/dev/null 2>&1; then
     docker ps -aq | xargs -r docker stop || true
     docker ps -aq | xargs -r docker rm || true
   fi
 
   apt_quiet remove -y docker docker.io docker-engine containerd runc || true
-  systemctl stop docker containerd >/dev/null 2>&1 || true
-  systemctl disable docker containerd >/dev/null 2>&1 || true
-
   umount /var/lib/docker 2>/dev/null || true
   rm -rf /var/lib/docker /var/lib/containerd /etc/docker || true
 
   # 释放关键端口
-  for p in 80 81 443 "$PORT_COCKPIT" "$PORT_NOVNC" "$PORT_VNC" "$PORT_WP_HTTP" "$PORT_NC_HTTP" "$PORT_OO_HTTP"; do
+  for p in 80 81 443 9090 6080 5905 9080 9000 9980; do
     wait_for_port_free "$p"
   done
 
@@ -202,7 +198,6 @@ services:
       - ./letsencrypt:/etc/letsencrypt
 EOF
   (cd "$ROOT_DIR/npm" && docker compose up -d)
-  # 等 NPM UI 就绪
   wait_for_http "http://127.0.0.1:81" 200 240 || yellow "NPM UI 未返回 200，但继续..."
   green "[OK] NPM 已启动（80/81/443）"
 fi
@@ -309,7 +304,6 @@ fi
 #======================== 步骤 7：配置 WordPress 多站点 ========================#
 if step 7 "配置 WordPress Multisite (wp-config.php)"; then
   WP_PATH="$ROOT_DIR/wp/html"
-  # 等待 WP 初始化落盘
   t=0
   while [[ ! -f "$WP_PATH/wp-config-sample.php" && $t -lt 240 ]]; do
     sleep 3; t=$((t+3))
@@ -331,7 +325,6 @@ if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PR
 EOF
     green "[OK] wp-config.php 多站点参数写入完成"
   }
-  # 强制网络后台跳转
   mkdir -p "$WP_PATH"
   cat >"$WP_PATH/.htaccess" <<'EOF'
 RewriteEngine On
@@ -346,9 +339,7 @@ if step 8 "部署 Cockpit / noVNC (VNC:5905 / noVNC:6080)"; then
   apt_quiet install -y cockpit cockpit-networkmanager cockpit-packagekit
   systemctl enable cockpit --now || true
 
-  # noVNC + VNC Server（XFCE 桌面）
   apt_quiet install -y novnc websockify tigervnc-standalone-server xfce4 xfce4-goodies
-  # VNC 密码
   mkdir -p /root/.vnc
   echo "${VNC_PASS}" | vncpasswd -f >/root/.vnc/passwd
   chmod 600 /root/.vnc/passwd
@@ -359,7 +350,6 @@ startxfce4 &
 EOF
   chmod +x /root/.vnc/xstartup
 
-  # systemd 管理 VNC :5
   cat >/etc/systemd/system/vnc@5.service <<EOF
 [Unit]
 Description=VNC Server :5
@@ -377,7 +367,6 @@ EOF
   systemctl daemon-reload
   systemctl enable vnc@5 --now
 
-  # noVNC 反代端口
   wait_for_port_free "$PORT_NOVNC"
   nohup websockify --web=/usr/share/novnc/ ${PORT_NOVNC} localhost:${PORT_VNC} >/dev/null 2>&1 &
 
@@ -386,7 +375,7 @@ fi
 
 #======================== 步骤 9：Fail2ban + UFW ========================#
 if step 9 "配置 Fail2ban + UFW 防火墙"; then
-  apt_quiet install -y fail2ban ufw
+  apt_quiet install -y fail2ban
   local_ignore="127.0.0.1/8"
   for ip in "${WHITELIST_IPS[@]}"; do local_ignore+=" ${ip}"; done
 
@@ -418,10 +407,10 @@ EOF
   green "[OK] 防火墙与 Fail2ban 已生效"
 fi
 
-#======================== 步骤 10：/etc/hosts 写入（容器内部解析） ========================#
+#======================== 步骤 10：/etc/hosts 写入 ========================#
 if step 10 "/etc/hosts 写入（指向当前 SERVER_IP）"; then
   for d in "${DOMAINS_ALL[@]}"; do
-    if ! grep -qE "[[:space:]]${d}\$" /etc/hosts; then
+    if ! grep -qE "[[:space:]]${d}$" /etc/hosts; then
       echo "${SERVER_IP} ${d}" >> /etc/hosts
       echo " + hosts 添加：${d}"
     fi
@@ -433,7 +422,6 @@ fi
 NPM_API="http://127.0.0.1:81/api"
 TOKEN=""
 npm_api_login() {
-  # NPM v2.13+ 获取短期 token（Bearer）
   local payload resp
   payload="{\"identity\":\"${NPM_ADMIN_USER}\",\"secret\":\"${NPM_ADMIN_PASS}\"}"
   resp="$(curl -sS -H "Content-Type: application/json" -X POST "${NPM_API}/tokens" -d "$payload" || true)"
@@ -441,9 +429,7 @@ npm_api_login() {
   TOKEN="$(echo "$resp" | jq -r '.token // empty')"
   [[ -z "$TOKEN" || "$TOKEN" == "null" ]] && return 1 || return 0
 }
-
 npm_auth_hdr() { echo "Authorization: Bearer ${TOKEN}"; }
-
 ensure_token_ready() {
   local tries=0
   until npm_api_login; do
@@ -453,7 +439,6 @@ ensure_token_ready() {
   done
   return 0
 }
-
 create_proxy_host() {
   local domain="$1" target="$2"
   local host="$(echo "$target" | sed 's~http://~~; s~https://~~;')"
@@ -467,7 +452,6 @@ create_proxy_host() {
                -X POST "${NPM_API}/nginx/proxy-hosts" -d "$req" || true)"
   json_or_empty "$resp"
 }
-
 get_proxy_id() {
   local domain="$1"
   local resp="$(curl -sS -H "$(npm_auth_hdr)" "${NPM_API}/nginx/proxy-hosts" || true)"
@@ -510,7 +494,6 @@ issue_cert() {
               -X POST "${NPM_API}/certificates" -d "$req" || true)"
   echo "$(json_or_empty "$resp")"
 }
-
 bind_cert() {
   local proxy_id="$1" cert_id="$2"
   local req resp
@@ -520,7 +503,6 @@ bind_cert() {
               -X PUT "${NPM_API}/nginx/proxy-hosts/${proxy_id}" -d "$req" || true)"
   json_or_empty "$resp" >/dev/null || true
 }
-
 dns_points_to_me() {
   local d="$1"
   local a
@@ -539,7 +521,6 @@ if step 12 "申请并绑定 SSL（批量）"; then
     fi
     green "  [OK] DNS 正确"
 
-    # 查找 Proxy Host ID
     hid="$(get_proxy_id "$d" | tr -d '\n')"
     if [[ -z "$hid" || "$hid" == "null" ]]; then
       yellow "  ❌ 未找到 Proxy Host，跳过"
@@ -547,7 +528,6 @@ if step 12 "申请并绑定 SSL（批量）"; then
     fi
     echo "  Proxy Host ID: $hid"
 
-    # 申请证书，最多重试 3 次（防止 NPM 返回 HTML 导致 jq 错误）
     cid=""
     for try in 1 2 3; do
       resp="$(issue_cert "$d")"
@@ -569,7 +549,6 @@ if step 12 "申请并绑定 SSL（批量）"; then
     green "  SSL 已绑定"
   done
 
-  # 重载 NPM
   docker exec npm nginx -s reload || true
   green "[OK] NPM 已重载"
 fi
