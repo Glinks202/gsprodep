@@ -1,6 +1,55 @@
 #!/usr/bin/env bash
 set -e
 
+SERVER_IP="82.180.137.120"
+
+# 所有必须解析的子域名
+DOMAINS=(
+  "hulin.pro"
+  "wp.hulin.pro"
+  "dri.hulin.pro"
+  "doc.hulin.pro"
+  "coc.hulin.pro"
+  "npm.hulin.pro"
+  "panel.hulin.pro"
+  "vnc.hulin.pro"
+  "admin.hulin.pro"
+)
+
+echo "==============================="
+echo "🔍 GS PRO — DNS 自动检查开始"
+echo "服务器 IP：$SERVER_IP"
+echo "==============================="
+
+# 循环检测
+for DOMAIN in "${DOMAINS[@]}"; do
+    echo ""
+    echo "检查域名：$DOMAIN…"
+
+    # 检查解析结果
+    IP=$(dig +short $DOMAIN | tail -n1)
+
+    if [ -z "$IP" ]; then
+        echo "❌ 未找到解析记录：$DOMAIN"
+        echo "⚠️ 请确认已添加 A 记录 → $SERVER_IP"
+        exit 1
+    fi
+
+    if [ "$IP" != "$SERVER_IP" ]; then
+        echo "❌ DNS 指向错误"
+        echo "域名：$DOMAIN"
+        echo "当前 IP：$IP"
+        echo "正确 IP：$SERVER_IP"
+        exit 1
+    fi
+
+    echo "✔ 正确：$DOMAIN → $IP"
+done
+
+echo ""
+echo "=============================================="
+echo "🎉 所有 DNS 匹配正确，可以继续部署！"
+echo "=============================================="
 #######################################################################
 # GS PRO — FULL AUTO DEPLOY SCRIPT
 # Ubuntu 24.04 LTS  |  By ChatGPT + Hulin Gao  |  2025-11-30
