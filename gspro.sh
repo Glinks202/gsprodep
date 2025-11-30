@@ -555,58 +555,7 @@ vnc.$MAIN_DOMAIN
 coc.$MAIN_DOMAIN
 "
 
-echo "📌 开始批量申请 SSL..."
 
-for DOMAIN in $SSL_LIST; do
-    echo ""
-    echo "▶︎ 域名：$DOMAIN"
-
-    if ! dns_ok "$DOMAIN"; then
-        yellow " ✗ DNS 未指向 $SERVER_IP，跳过"
-        continue
-    fi
-
-    echo " ✓ DNS 正确"
-
-    HID=$(get_host_id "$DOMAIN")
-    if [[ -z "$HID" ]]; then
-        yellow "未找到 Proxy Host，重试中..."
-        sleep 8
-        HID=$(get_host_id "$DOMAIN")
-    fi
-
-    if [[ -z "$HID" ]]; then
-        red "无法匹配 Host ID，跳过 $DOMAIN"
-        continue
-    fi
-
-    echo " → Proxy Host ID: $HID"
-    echo " → 创建证书中..."
-
-    RES=$(create_cert "$DOMAIN")
-    CID=$(echo "$RES" | jq -r ".id")
-
-    if [[ "$CID" == "null" || -z "$CID" ]]; then
-        yellow "第一次失败，等待 60 秒再试..."
-        sleep 60
-        RES=$(create_cert "$DOMAIN")
-        CID=$(echo "$RES" | jq -r ".id")
-    fi
-
-    if [[ "$CID" == "null" || -z "$CID" ]]; then
-        red "证书失败，跳过"
-        continue
-    fi
-
-    bind_cert "$HID" "$CID"
-    echo " ✓ SSL 已绑定"
-done
-
-ok "所有 SSL 流程完成"
-
-# 重载 NPM
-docker exec npm nginx -s reload || true
-ok "NPM 重载完成（SSL 生效）"
 ##########################################################################
 # Step 15 — Fail2ban 安装 + 自动配置（含白名单）
 ##########################################################################
