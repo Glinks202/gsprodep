@@ -1,4 +1,59 @@
 #!/bin/bash
+#!/bin/bash
+############################################
+#     GS-PRO — 自动部署 + 自动断点恢复
+############################################
+set -e
+
+PROGRESS_FILE="/root/.gspro-progress"
+
+green(){ echo -e "\033[1;32m$1\033[0m"; }
+yellow(){ echo -e "\033[1;33m$1\033[0m"; }
+red(){ echo -e "\033[1;31m$1\033[0m"; }
+
+############################################
+# STEP 恢复功能
+############################################
+step(){
+    local STEP_NUM="$1"
+    local STEP_NAME="$2"
+
+    # 如存在断点，跳过旧步骤
+    if [ -f "$PROGRESS_FILE" ]; then
+        LAST_STEP=$(cat $PROGRESS_FILE)
+        if (( STEP_NUM <= LAST_STEP )); then
+            yellow "跳过步骤 $STEP_NUM：$STEP_NAME（已完成）"
+            return 1
+        fi
+    fi
+
+    echo "$STEP_NUM" > $PROGRESS_FILE
+    green "开始步骤 $STEP_NUM：$STEP_NAME"
+    return 0
+}
+
+############################################
+# 环境检测
+############################################
+if [[ $EUID -ne 0 ]]; then
+    red "必须使用 root 执行"
+    exit 1
+fi
+green "✓ 已使用 root"
+
+if ! grep -q "Ubuntu 24.04" /etc/os-release; then
+    red "必须 Ubuntu 24.04 LTS"
+    exit 1
+fi
+green "✓ Ubuntu 24.04 LTS OK"
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+green "服务器 IP：$SERVER_IP"
+
+
+############################################
+# 你的原始脚本内容从这里继续…
+############################################
 ###############################
 # GS-PRO: 环境检测 + 自动修复
 #（可直接插入原 gspro.sh 顶部）
