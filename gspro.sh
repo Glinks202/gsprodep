@@ -1,4 +1,116 @@
 #!/bin/bash
+###############################
+# GS-PRO: 环境检测 + 自动修复
+#（可直接插入原 gspro.sh 顶部）
+###############################
+set -e
+
+GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; NC="\033[0m"
+ok(){ echo -e "${GREEN}[OK]${NC} $1"; }
+warn(){ echo -e "${YELLOW}[WARN]${NC} $1"; }
+err(){ echo -e "${RED}[ERROR]${NC} $1" && exit 1; }
+
+echo -e "${GREEN}==== GS-PRO 环境检测（已加载） ====${NC}"
+
+########################################
+# 1. root 检查
+########################################
+if [[ $EUID -ne 0 ]]; then
+    err "必须使用 root 执行脚本"
+fi
+ok "root 权限正常"
+
+########################################
+# 2. 系统检查（必须 Ubuntu 24.04）
+########################################
+if ! grep -q "Ubuntu 24.04" /etc/os-release; then
+    err "需要 Ubuntu 24.04 LTS，当前系统不兼容"
+fi
+ok "系统版本正确（Ubuntu 24.04）"
+
+########################################
+# 3. 服务器 IP 获取
+########################################
+SERVER_IP=$(hostname -I | awk '{print $1}')
+ok "当前服务器 IP：$SERVER_IP"
+
+########################################
+# 4. DNS 检查函数（可复用）
+########################################
+check_dns(){
+    local dom="$1"
+    local rec=$(dig +short "$dom" | tail -n1)
+    if [[ "$rec" == "$SERVER_IP" ]]; then
+        ok "$dom → DNS 正确"
+    else
+        warn "$dom → DNS 错误（当前：$rec，应为：$SERVER_IP）"
+    fi
+}
+
+########################################
+# 5. Docker 自动检测 / 修复
+########################################
+echo "[GS-PRO] 正在检测 Docker..."
+
+REINSTALL_DOCKER=0
+
+if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker 未安装 → 将安装"
+    REINSTALL_DOCKER=1
+else
+    if ! docker ps >/dev/null 2>&1; then
+        warn "Docker 损坏或未正常运行 → 将修复"
+        REINSTALL_DOCKER=1
+    else
+        ok "Docker 正常运行"
+    fi
+fi
+
+if [[ $REINSTALL_DOCKER -eq 1 ]]; then
+    echo "[GS-PRO] 清理损坏的 Docker..."
+    systemctl stop docker || true
+    systemctl disable docker || true
+    rm -rf /var/lib/docker /etc/docker \
+           /usr/lib/systemd/system/docker.* || true
+
+    echo "[GS-PRO] 安装最新 Docker..."
+    curl -fsSL https://get.docker.com | bash
+    ok "Docker 已完成安装/修复"
+fi
+
+########################################
+# 6. 端口占用检查（80 / 443）
+########################################
+echo "[GS-PRO] 检查 80 / 443 端口占用..."
+
+for p in 80 443; do
+    if lsof -i :$p >/dev/null 2>&1; then
+        pid=$(lsof -t -i:$p)
+        warn "端口 $p 被占用（PID: $pid），自动释放..."
+        kill -9 "$pid" || true
+    else
+        ok "端口 $p 空闲"
+    fi
+done
+
+########################################
+# 7. 自动恢复（继续执行剩余步骤）
+########################################
+STATUS_FILE="/root/.gspro-status"
+
+if [[ -f "$STATUS_FILE" ]]; then
+    STEP=$(cat "$STATUS_FILE")
+    warn "检测到未完成部署 → 从步骤 $STEP 自动恢复"
+else
+    echo "0" > "$STATUS_FILE"
+    ok "初始化部署步骤文件"
+fi
+
+echo -e "${GREEN}==== 环境检测完成，将继续执行原脚本 ====${NC}"
+
+###############################
+# （下面开始执行你原有的 gspro.sh 内容）
+###############################
 ##########################################################################
 #  GS-PRO 全自动一键部署脚本 (Ubuntu 24.04 LTS)
 #  Author: GLINKS
