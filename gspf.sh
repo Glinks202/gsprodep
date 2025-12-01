@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# =========================
-# GS-PRO VPS FINAL EDITION
-# Fully Automated Deployment
-# Ubuntu 24.04 LTS Only
-# =========================
 set -Eeuo pipefail
+
+###############################################
+# GS-PRO FULL VPS DEPLOYER (IDEMPOTENT EDITION)
+# Ubuntu 24.04 LTS ONLY
+###############################################
 
 ### ========== 基础变量 ========== ###
 MAIN_DOMAIN="hulin.pro"
 EMAIL="gs@hulin.pro"
+
 NPM_ADMIN_USER="admin"
 NPM_ADMIN_PASS="Gaomeilan862447#"
 
@@ -16,9 +17,9 @@ SERVER_IP="$(hostname -I | awk '{print $1}')"
 
 DOMAINS_ALL=(
   "hulin.pro"
+  "wp.hulin.pro"
   "ezglinns.com"
   "gsliberty.com"
-  "wp.hulin.pro"
   "dri.hulin.pro"
   "doc.hulin.pro"
   "npm.hulin.pro"
@@ -37,206 +38,171 @@ WHITE_IPS=("172.56.160.206" "172.56.164.101" "176.56.161.108")
 
 ROOT_DIR="/gspro"
 LOG_FILE="/root/gspro.log"
-PROGRESS_FILE="/root/.gspro-progress"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 ### ========== 打印工具 ========== ###
 green(){ echo -e "\033[1;32m$*\033[0m"; }
 yellow(){ echo -e "\033[1;33m$*\033[0m"; }
 red(){ echo -e "\033[1;31m$*\033[0m"; }
 
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-### ========== 断点恢复 ========== ###
-step() {
-  local num="$1"; shift
-  local title="$*"
-  local last=0
-
-  [[ -f "$PROGRESS_FILE" ]] && last="$(cat "$PROGRESS_FILE" || echo 0)"
-
-  if [[ "$last" -ge "$num" ]]; then
-    yellow "[SKIP] Step $num: $title"
-    return 1
-  fi
-
-  echo "$num" > "$PROGRESS_FILE"
-  green "[RUN] Step $num: $title"
-  return 0
+### ========== 幂等检查函数 ========== ###
+container_ok() {
+    docker ps --format '{{.Names}}' | grep -q "^$1$"
 }
 
-### ========== 基础检查 ========== ###
-need_root(){ [[ $EUID -ne 0 ]] && { red "必须使用 root"; exit 1; }; }
-need_ubuntu(){ grep -q "Ubuntu 24.04" /etc/os-release || { red "必须 Ubuntu 24.04"; exit 1; }; }
-
-apt_quiet(){ DEBIAN_FRONTEND=noninteractive apt-get -yq "$@"; }
-
-wait_port_free(){
-  p="$1"
-  if ss -tulpn | grep -q ":$p"; then
-    ids=$(ss -tulpn | grep ":$p" | sed -E 's/.*pid=([0-9]+).*/\1/')
-    for pid in $ids; do kill -9 "$pid" || true; done
-    sleep 1
-  fi
+service_ok() {
+    systemctl is-active "$1" >/dev/null 2>&1
 }
 
-wait_http(){
-  url="$1"; code="${2:-200}"; timeout="${3:-180}"
-  t=0
-  while (( t < timeout )); do
-    c=$(curl -sk -o /dev/null -w '%{http_code}' "$url" || true)
-    [[ "$c" == "$code" ]] && return 0
-    sleep 3; t=$((t+3))
-  done
-  return 1
+port_open() {
+    ss -tulpn | grep -q ":$1"
 }
 
-json_fix(){
-  local x="$1"
-  echo "$x" | jq . >/dev/null 2>&1 && echo "$x" || echo "{}"
+http_ok() {
+    curl -sk -o /dev/null -w "%{http_code}" "$1" | grep -q "^200$"
 }
-###===============================================
-### Step 0 — 系统检查
-###===============================================
-if step 0 "基础系统检查"; then
-  need_root
-  need_ubuntu
-  apt_quiet update
-  apt_quiet install -y curl jq ca-certificates gnupg lsb-release dnsutils ufw
-  green "[OK] 系统检查完毕，Ubuntu 24.04 LTS"
+
+### ========== 强制清理函数 ========== ###
+clean_containers() {
+    yellow "[清理] Docker 容器：$*"
+    docker rm -f $* >/dev/null 2>&1 || true
+}
+
+clean_dir() {
+    yellow "[清理] 目录：$1"
+    rm -rf "$1" >/dev/null 2>&1 || true
+}
+
+free_port() {
+    local PORT=$1
+    if port_open "$PORT"; then
+        PIDS=$(ss -tulpn | grep ":$PORT" | sed -E 's/.*pid=([0-9]+).*/\1/')
+        for PID in $PIDS; do
+            yellow "[释放端口] 杀死 PID $PID (端口 $PORT)"
+            kill -9 "$PID" >/dev/null 2>&1 || true
+        done
+        sleep 1
+    fi
+}
+
+### ========== 系统检查 ========== ###
+green "[系统] 检查 root 权限"
+if [[ $EUID -ne 0 ]]; then
+  red "必须使用 root 执行"
+  exit 1
 fi
 
-###===============================================
-### Step 1 — 清理旧环境（Docker / Nginx / Apache）
-###===============================================
-if step 1 "清理旧环境并释放端口"; then
-  systemctl stop docker nginx apache2 containerd >/dev/null 2>&1 || true
-  systemctl disable docker nginx apache2 containerd >/dev/null 2>&1 || true
+green "[系统] 检查 Ubuntu 版本"
+grep -q "Ubuntu 24.04" /etc/os-release || {
+  red "必须使用 Ubuntu 24.04 LTS"
+  exit 1
+}
 
-  apt_quiet remove -y nginx* apache2* docker docker.io containerd runc || true
-  rm -rf /var/lib/docker /var/lib/containerd /etc/docker 2>/dev/null || true
+### ========== Step 1：基础环境安装 ========== ###
+green "[Step 1] 安装基础工具"
+apt update -y
+apt install -y ca-certificates curl jq gnupg lsb-release ufw dnsutils
 
-  # 关键端口释放
-  for P in 80 81 443 9080 9000 9980 9090 5905 6080; do
-    wait_port_free "$P"
-  done
+### ========== Step 2：安装 Docker（幂等） ========== ###
+green "[Step 2] 检查 Docker 是否已安装"
 
-  green "[OK] 旧环境清理完成"
-fi
+if service_ok docker; then
+    green "[SKIP] Docker 已安装并运行"
+else
+    yellow "[安装] Docker"
 
-###===============================================
-### Step 2 — 安装 Docker + Compose
-###===============================================
-if step 2 "安装 Docker / Docker Compose"; then
-  install -m 0755 -d /etc/apt/keyrings
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-
-  echo \
+    echo \
 "deb [arch=$(dpkg --print-architecture) \
 signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu noble stable" \
-  >/etc/apt/sources.list.d/docker.list
+      >/etc/apt/sources.list.d/docker.list
 
-  apt_quiet update
-  apt_quiet install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+    apt update -y
+    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-  systemctl enable docker --now
-  green "[OK] Docker 安装完成"
+    systemctl enable --now docker
+    green "[OK] Docker 已安装并启动"
 fi
 
-###===============================================
-### Step 3 — 创建目录结构
-###===============================================
-if step 3 "创建目录结构"; then
-  mkdir -p "$ROOT_DIR"/{npm,nextcloud,office,wp,cockpit,novnc,portainer,ssl,logs,config}
-  mkdir -p "$ROOT_DIR"/personal "$ROOT_DIR"/glinns "$ROOT_DIR"/gsliberty
+### ========== Step 3：创建部署目录（幂等） ========== ###
+green "[Step 3] 创建目录结构"
+mkdir -p \
+  "$ROOT_DIR" \
+  "$ROOT_DIR/npm" \
+  "$ROOT_DIR/wp" \
+  "$ROOT_DIR/nextcloud" \
+  "$ROOT_DIR/office" \
+  "$ROOT_DIR/novnc" \
+  "$ROOT_DIR/cockpit" \
+  "$ROOT_DIR/portainer" \
+  "$ROOT_DIR/personal" \
+  "$ROOT_DIR/glinns" \
+  "$ROOT_DIR/gsliberty"
 
-  green "[OK] 已创建目录："
-  echo "$ROOT_DIR/{npm,nextcloud,office,wp,cockpit,novnc,portainer,ssl,logs,config}"
-  echo "$ROOT_DIR/personal"
-  echo "$ROOT_DIR/glinns"
-  echo "$ROOT_DIR/gsliberty"
-fi
-###===============================================
-### Step 4 — 部署 Nginx Proxy Manager
-###===============================================
-if step 4 "部署 NPM（反代主控）"; then
-  cat >"$ROOT_DIR/npm/docker-compose.yml" <<EOF
-version: "3.8"
+green "[OK] 目录已准备好
+###############################################
+# ========== Step 4：部署 NPM（幂等） ==========
+###############################################
+
+green "[Step 4] 部署 Nginx Proxy Manager"
+
+if container_ok npm && http_ok "http://127.0.0.1:81"; then
+    green "[SKIP] NPM 已安装，且 Web 接口正常"
+else
+    yellow "[重新部署] 清理旧 NPM"
+    clean_containers npm
+    clean_dir "$ROOT_DIR/npm"
+
+    mkdir -p "$ROOT_DIR/npm"
+    cat > "$ROOT_DIR/npm/docker-compose.yml" <<EOF
+version: "3.9"
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
     container_name: npm
-    restart: always
+    restart: unless-stopped
     ports:
       - "80:80"
       - "81:81"
       - "443:443"
     volumes:
       - ./data:/data
-      - ./letsencrypt:/etc/letsencrypt
+      - ./letsencrypt:/etc/letsencrypt"
 EOF
 
-  (cd "$ROOT_DIR/npm" && docker compose up -d)
-
-  wait_http "http://127.0.0.1:81" 200 180 || yellow "[Warn] NPM 未返回 200，但继续部署"
-
-  green "[OK] NPM 已启动"
+    (cd "$ROOT_DIR/npm" && docker compose up -d)
+    sleep 5
+    green "[OK] 已启动 NPM"
 fi
 
-###===============================================
-### Step 5 — 部署 Nextcloud + OnlyOffice
-###===============================================
-if step 5 "部署 Nextcloud + OnlyOffice"; then
-  cat >"$ROOT_DIR/nextcloud/docker-compose.yml" <<EOF
-version: "3.8"
+
+###############################################
+# Step 5：部署 WordPress Multisite（幂等）
+###############################################
+
+green "[Step 5] 检查 WordPress Multisite"
+
+if container_ok wp_db && container_ok wp_fpm && container_ok wp_nginx; then
+    green "[SKIP] WordPress 容器存在"
+else
+    yellow "[重新部署] 清理 WordPress"
+    clean_containers wp_db wp_fpm wp_nginx
+    clean_dir "$ROOT_DIR/wp"
+
+    mkdir -p "$ROOT_DIR/wp"
+    cat > "$ROOT_DIR/wp/docker-compose.yml" <<EOF
+version: "3.9"
 services:
+
   db:
     image: mariadb:10.11
-    restart: always
-    container_name: nc_db
-    environment:
-      MYSQL_ROOT_PASSWORD: ${NPM_ADMIN_PASS}
-      MYSQL_DATABASE: nextcloud
-      MYSQL_USER: ncuser
-      MYSQL_PASSWORD: ${NPM_ADMIN_PASS}
-    volumes:
-      - ./db:/var/lib/mysql
-
-  nextcloud:
-    image: nextcloud:latest
-    restart: always
-    container_name: nextcloud_app
-    depends_on: [db]
-    ports:
-      - "${PORT_NC_HTTP}:80"
-    volumes:
-      - ./html:/var/www/html
-
-  onlyoffice:
-    image: onlyoffice/documentserver
-    restart: always
-    container_name: onlyoffice
-    ports:
-      - "${PORT_OO_HTTP}:80"
-EOF
-
-  (cd "$ROOT_DIR/nextcloud" && docker compose up -d)
-  green "[OK] Nextcloud & OnlyOffice 已启动"
-fi
-
-###===============================================
-### Step 6 — 部署 WordPress Multisite
-###===============================================
-if step 6 "部署 WordPress Multisite"; then
-  cat >"$ROOT_DIR/wp/docker-compose.yml" <<EOF
-version: "3.8"
-services:
-  db:
-    image: mariadb:10.11
-    restart: always
     container_name: wp_db
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${NPM_ADMIN_PASS}
       MYSQL_DATABASE: wordpress
@@ -245,69 +211,76 @@ services:
     volumes:
       - ./db:/var/lib/mysql
 
-  fpm:
+  wp_fpm:
     image: wordpress:php8.2-fpm
-    restart: always
     container_name: wp_fpm
-    depends_on: [db]
+    restart: unless-stopped
     environment:
       WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
       WORDPRESS_DB_USER: wpuser
       WORDPRESS_DB_PASSWORD: ${NPM_ADMIN_PASS}
-      WORDPRESS_DB_NAME: wordpress
     volumes:
       - ./html:/var/www/html
+    depends_on:
+      - db
 
-  web:
-    image: nginx:latest
-    restart: always
-    container_name: wp_web
+  wp_nginx:
+    image: nginx:stable
+    container_name: wp_nginx
+    restart: unless-stopped
     ports:
       - "${PORT_WP_HTTP}:80"
     volumes:
       - ./html:/var/www/html
       - ./nginx.conf:/etc/nginx/conf.d/default.conf
-    depends_on: [fpm]
+    depends_on:
+      - wp_fpm
 EOF
 
-  # NGINX 配置
-  cat >"$ROOT_DIR/wp/nginx.conf" <<'EOF'
+    cat > "$ROOT_DIR/wp/nginx.conf" <<EOF
 server {
     listen 80;
+    server_name _;
     root /var/www/html;
     index index.php index.html;
 
     location / {
-        try_files $uri $uri/ /index.php?$args;
+        try_files \$uri \$uri/ /index.php?\$args;
     }
 
     location ~ \.php$ {
         include fastcgi_params;
         fastcgi_pass wp_fpm:9000;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
     }
 }
 EOF
 
-  (cd "$ROOT_DIR/wp" && docker compose up -d)
-
-  green "[OK] WordPress（多站点）已部署"
+    (cd "$ROOT_DIR/wp" && docker compose up -d)
+    green "[OK] 已启动 WordPress"
 fi
 
-###===============================================
-### Step 7 — 配置 Multisite 参数
-###===============================================
-if step 7 "配置 WordPress 多站点参数"; then
-  WP_PATH="$ROOT_DIR/wp/html"
 
-  t=0
-  while [[ ! -f "$WP_PATH/wp-config-sample.php" && $t -lt 240 ]]; do
-    sleep 3; t=$((t+3))
-  done
+###############################################
+# Step 6：WordPress Multisite 配置（幂等）
+###############################################
 
-  if [[ -f "$WP_PATH/wp-config-sample.php" ]]; then
-    cp -n "$WP_PATH/wp-config-sample.php" "$WP_PATH/wp-config.php"
-    cat >>"$WP_PATH/wp-config.php" <<EOF
+WP_PATH="$ROOT_DIR/wp/html"
+if [[ -f "$WP_PATH/wp-config.php" ]] && grep -q "MULTISITE" "$WP_PATH/wp-config.php"; then
+    green "[SKIP] WP Multisite 已配置"
+else
+    yellow "[配置] 写入 WordPress Multisite 参数"
+
+    # 等待 WP HTML 生成
+    t=0
+    while [[ ! -f "$WP_PATH/wp-config-sample.php" && $t -lt 240 ]]; do
+        sleep 3; t=$((t+3))
+    done
+
+    cp -n "$WP_PATH/wp-config-sample.php" "$WP_PATH/wp-config.php" || true
+
+    cat >> "$WP_PATH/wp-config.php" <<EOF
 
 define( 'WP_ALLOW_MULTISITE', true );
 define( 'MULTISITE', true );
@@ -318,43 +291,125 @@ define( 'SITE_ID_CURRENT_SITE', 1 );
 define( 'BLOG_ID_CURRENT_SITE', 1 );
 define( 'COOKIE_DOMAIN', '' );
 
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO']==='https') {
-  \$_SERVER['HTTPS'] = 'on';
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) 
+    && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') { 
+    \$_SERVER['HTTPS'] = 'on'; 
 }
 EOF
+
     green "[OK] WordPress Multisite 配置完成"
-  else
-    yellow "[WARN] 未找到 wp-config-sample.php"
-  fi
-fi
-###===============================================
-### Step 8 — 部署 Cockpit（系统管理面板）
-###===============================================
-if step 8 "部署 Cockpit 管理面板"; then
-  apt_quiet install -y cockpit cockpit-networkmanager cockpit-packagekit
-  systemctl enable --now cockpit
-  green "[OK] Cockpit 已启动（端口 ${PORT_COCKPIT}）"
 fi
 
-###===============================================
-### Step 9 — 安装 XFCE4 + VNC（5905）+ noVNC（6080）
-###===============================================
-if step 9 "部署 VNC + noVNC + XFCE 桌面环境"; then
-  apt_quiet install -y xfce4 xfce4-goodies tigervnc-standalone-server novnc websockify
 
-  mkdir -p /root/.vnc
-  echo "${NPM_ADMIN_PASS}" | vncpasswd -f >/root/.vnc/passwd
-  chmod 600 /root/.vnc/passwd
+###############################################
+# Step 7：部署 Nextcloud + OnlyOffice（幂等）
+###############################################
 
-  cat >/root/.vnc/xstartup <<'EOF'
-#!/bin/sh
-xrdb $HOME/.Xresources
-startxfce4 &
+green "[Step 7] 检查 Nextcloud / OnlyOffice"
+
+if container_ok nc_db && container_ok nextcloud-app && container_ok onlyoffice; then
+    green "[SKIP] Nextcloud & OnlyOffice 已部署"
+else
+    yellow "[重新部署] 清理 Nextcloud / OnlyOffice"
+    clean_containers nc_db nextcloud-app onlyoffice
+    clean_dir "$ROOT_DIR/nextcloud"
+
+    mkdir -p "$ROOT_DIR/nextcloud"
+    cat > "$ROOT_DIR/nextcloud/docker-compose.yml" <<EOF
+version: "3.9"
+services:
+
+  db:
+    image: mariadb:10.11
+    container_name: nc_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${NPM_ADMIN_PASS}
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: ncuser
+      MYSQL_PASSWORD: ${NPM_ADMIN_PASS}
+    volumes:
+      - ./db:/var/lib/mysql
+
+  app:
+    image: nextcloud:latest
+    container_name: nextcloud-app
+    restart: unless-stopped
+    depends_on: [db]
+    ports:
+      - "${PORT_NC_HTTP}:80"
+    volumes:
+      - ./html:/var/www/html
+
+  onlyoffice:
+    image: onlyoffice/documentserver
+    container_name: onlyoffice
+    restart: unless-stopped
+    ports:
+      - "${PORT_OO_HTTP}:80"
 EOF
 
-  chmod +x /root/.vnc/xstartup
+    (cd "$ROOT_DIR/nextcloud" && docker compose up -d)
+    green "[OK] Nextcloud + OnlyOffice 已启动"
+fi
 
-  cat >/etc/systemd/system/vnc@5.service <<EOF
+
+###############################################
+# Step 8：Portainer（幂等）
+###############################################
+
+if container_ok portainer; then
+    green "[SKIP] Portainer 已安装"
+else
+    yellow "[部署] Portainer"
+
+    clean_containers portainer
+
+    docker volume create portainer_data >/dev/null 2>&1 || true
+
+    docker run -d \
+      -p 9443:9443 \
+      --name portainer \
+      --restart=always \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v portainer_data:/data \
+      portainer/portainer-ce
+
+    green "[OK] Portainer 已启动"
+fi
+
+
+###############################################
+# Step 9：Cockpit + VNC + noVNC（幂等）
+###############################################
+
+if service_ok cockpit; then
+    green "[SKIP] Cockpit 已安装"
+else
+    apt install -y cockpit cockpit-networkmanager cockpit-packagekit
+    systemctl enable --now cockpit
+    green "[OK] Cockpit 已安装"
+fi
+
+if port_open "$PORT_VNC"; then
+    green "[SKIP] VNC/noVNC 已运行"
+else
+    yellow "[部署] VNC + noVNC"
+
+    apt install -y novnc websockify tigervnc-standalone-server xfce4 xfce4-goodies
+
+    mkdir -p /root/.vnc
+    echo "$NPM_ADMIN_PASS" | vncpasswd -f >/root/.vnc/passwd
+    chmod 600 /root/.vnc/passwd
+
+    cat > /root/.vnc/xstartup <<EOF
+#!/bin/sh
+xrdb \$HOME/.Xresources
+startxfce4 &
+EOF
+    chmod +x /root/.vnc/xstartup
+
+    cat > /etc/systemd/system/vnc@5.service <<EOF
 [Unit]
 Description=VNC Server :5
 After=network.target
@@ -369,324 +424,268 @@ ExecStop=/usr/bin/vncserver -kill :5
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable vnc@5 --now
+    systemctl daemon-reload
+    systemctl enable --now vnc@5
 
-  nohup websockify --web=/usr/share/novnc/ ${PORT_NOVNC} localhost:${PORT_VNC} >/dev/null 2>&1 &
-
-  green "[OK] VNC (${PORT_VNC}) + noVNC (${PORT_NOVNC}) 已部署"
+    nohup websockify --web=/usr/share/novnc/ ${PORT_NOVNC} localhost:${PORT_VNC} >/dev/null 2>&1 &
+    green "[OK] noVNC 已启动"
 fi
 
-###===============================================
-### Step 10 — Fail2ban + UFW 防火墙
-###===============================================
-if step 10 "部署 Fail2ban + 防火墙配置"; then
-  apt_quiet install -y fail2ban
 
-  local_ignore="127.0.0.1/8"
-  for ip in "${WHITE_IPS[@]}"; do
-    local_ignore+=" ${ip}"
-  done
+###############################################
+# Step 10：Fail2ban + UFW
+###############################################
 
-  cat >/etc/fail2ban/jail.local <<EOF
+green "[Step 10] 配置 Fail2ban + UFW"
+
+apt install -y fail2ban
+
+IGNORE_IPS="127.0.0.1/8"
+for ip in "${WHITE_IPS[@]}"; do IGNORE_IPS+=" ${ip}"; done
+
+cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-ignoreip = ${local_ignore}
+ignoreip = ${IGNORE_IPS}
 bantime = 3600
 findtime = 600
 maxretry = 5
-backend = systemd
 
 [sshd]
 enabled = true
-port = ssh
-logpath = /var/log/auth.log
 EOF
 
-  systemctl enable --now fail2ban
+systemctl enable --now fail2ban
 
-  # UFW
-  ufw allow 22/tcp
-  ufw allow 80/tcp
-  ufw allow 81/tcp
-  ufw allow 443/tcp
-  ufw allow ${PORT_COCKPIT}/tcp
-  ufw allow ${PORT_VNC}/tcp
-  ufw allow ${PORT_NOVNC}/tcp
-  ufw --force enable
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 81/tcp
+ufw allow 443/tcp
+ufw allow ${PORT_COCKPIT}/tcp
+ufw allow ${PORT_VNC}/tcp
+ufw allow ${PORT_NOVNC}/tcp
+ufw --force enable
 
-  green "[OK] 防火墙 & Fail2ban 已生效"
-fi
-###===============================================
-### Step 11 — 写入 /etc/hosts（强制）
-###===============================================
-if step 11 "更新 /etc/hosts"; then
-  for d in "${DOMAINS_ALL[@]}"; do
-    if ! grep -qE "[[:space:]]${d}$" /etc/hosts; then
-      echo "${SERVER_IP} ${d}" >> /etc/hosts
-      echo " + hosts 添加：${d}"
-    fi
-  done
-  green "[OK] /etc/hosts 更新完成"
-fi
+green "[OK] Fail2ban + UFW 已配置"
+###############################################
+# Step 11：NPM API 登录（自愈）
+###############################################
 
-###===============================================
-### NPM API 辅助函数
-###===============================================
+green "[Step 11] 尝试登录 NPM API"
+
 NPM_API="http://127.0.0.1:81/api"
 TOKEN=""
-
 npm_login() {
-  payload="{\"identity\":\"${NPM_ADMIN_USER}\",\"secret\":\"${NPM_ADMIN_PASS}\"}"
-  resp=$(curl -sS -H "Content-Type: application/json" -X POST "${NPM_API}/tokens" -d "$payload" || true)
-  resp=$(json_fix "$resp")
-  TOKEN=$(echo "$resp" | jq -r '.token // empty')
-  [[ -n "$TOKEN" && "$TOKEN" != "null" ]]
+    local P="{\"identity\":\"$NPM_ADMIN_USER\",\"secret\":\"$NPM_ADMIN_PASS\"}"
+    local R
+    R="$(curl -s -H "Content-Type: application/json" -X POST "$NPM_API/tokens" -d "$P" || true)"
+    TOKEN="$(echo "$R" | jq -r '.token // empty')"
+    [[ -n "$TOKEN" && "$TOKEN" != "null" ]]
 }
 
-npm_auth() {
-  echo "Authorization: Bearer ${TOKEN}"
-}
+retry_login=0
+until npm_login; do
+    retry_login=$((retry_login+1))
+    [[ $retry_login -gt 20 ]] && red "NPM 登录失败" && exit 1
+    yellow "NPM 登录失败，等待 5 秒重试 ($retry_login/20)"
+    sleep 5
+done
 
-npm_wait_login() {
-  local t=0
-  until npm_login; do
-    t=$((t+1))
-    [[ $t -gt 30 ]] && return 1
-    sleep 4
-  done
-  return 0
+green "[OK] 成功登录 NPM API"
+
+
+###############################################
+# 辅助函数：反代创建/检测
+###############################################
+
+proxy_id_by_domain() {
+    curl -s -H "Authorization: Bearer $TOKEN" "$NPM_API/nginx/proxy-hosts" |
+        jq ".[] | select(.domain_names[]==\"$1\") | .id" | head -n1
 }
 
 create_proxy() {
-  domain="$1"
-  target="$2"
+    local domain="$1"
+    local url="$2"
+    local h="$(echo "$url" | sed 's~http://~~; s~https://~~;')"
+    local host="$(echo "$h" | cut -d: -f1)"
+    local port="$(echo "$h" | cut -d: -f2)"
 
-  host=$(echo "$target" | sed 's~http://~~; s~https://~~;')
-  fhost=$(echo "$host" | cut -d: -f1)
-  fport=$(echo "$host" | cut -d: -f2)
-
-  req=$(jq -nc \
+    local payload
+    payload="$(jq -nc \
         --argjson dn "[\"$domain\"]" \
-        --arg fhost "$fhost" \
-        --arg fport "$fport" \
-        '{
-          domain_names:$dn,
-          forward_scheme:"http",
-          forward_host:$fhost,
-          forward_port:($fport|tonumber),
-          certificate_id:0,
-          ssl_forced:false,
-          access_list_id:0
-        }')
+        --arg h "$host" \
+        --argjson p "$port" '
+    {
+      domain_names: $dn,
+      forward_scheme: "http",
+      forward_host: $h,
+      forward_port: ($p|tonumber),
+      access_list_id: 0,
+      certificate_id: 0,
+      ssl_forced: false
+    }'
+    )"
 
-  curl -sS -H "$(npm_auth)" -H "Content-Type: application/json" \
-      -X POST "${NPM_API}/nginx/proxy-hosts" -d "$req" >/dev/null 2>&1 || true
+    curl -s \
+         -H "Authorization: Bearer $TOKEN" \
+         -H "Content-Type: application/json" \
+         -X POST "$NPM_API/nginx/proxy-hosts" \
+         -d "$payload" >/dev/null 2>&1
 }
 
-get_proxy_id() {
-  domain="$1"
-  resp=$(curl -sS -H "$(npm_auth)" "${NPM_API}/nginx/proxy-hosts" || true)
-  resp=$(json_fix "$resp")
-  echo "$resp" | jq ".[] | select(.domain_names[]==\"$domain\") | .id" | head -n1
-}
+###############################################
+# Step 12：自动创建反代
+###############################################
 
-###===============================================
-### Step 12 — 创建反代（全自动）
-###===============================================
-if step 12 "创建反代配置（自动）"; then
-  wait_http "http://127.0.0.1:81" 200 180 || yellow "[Warn] NPM UI 异常继续"
+green "[Step 12] 创建反向代理（幂等）"
 
-  npm_wait_login || yellow "[WARN] NPM 登录失败，继续尝试"
-
-  declare -A MAP=(
-    ["hulin.pro"]="http://172.17.0.1:${PORT_WP_HTTP}"
-    ["wp.hulin.pro"]="http://172.17.0.1:${PORT_WP_HTTP}"
-    ["ezglinns.com"]="http://172.17.0.1:${PORT_WP_HTTP}"
-    ["gsliberty.com"]="http://172.17.0.1:${PORT_WP_HTTP}"
-
-    ["dri.hulin.pro"]="http://172.17.0.1:${PORT_NC_HTTP}"
-    ["doc.hulin.pro"]="http://172.17.0.1:${PORT_OO_HTTP}"
+declare -A PROXY_MAP=(
+    ["hulin.pro"]="http://172.17.0.1:$PORT_WP_HTTP"
+    ["wp.hulin.pro"]="http://172.17.0.1:$PORT_WP_HTTP"
+    ["ezglinns.com"]="http://172.17.0.1:$PORT_WP_HTTP"
+    ["hulin.bz"]="http://172.17.0.1:$PORT_WP_HTTP"
+    ["doc.hulin.pro"]="http://172.17.0.1:$PORT_OO_HTTP"
+    ["dri.hulin.pro"]="http://172.17.0.1:$PORT_NC_HTTP"
+    ["coc.hulin.pro"]="http://127.0.0.1:$PORT_COCKPIT"
     ["npm.hulin.pro"]="http://127.0.0.1:81"
-    ["coc.hulin.pro"]="http://127.0.0.1:${PORT_COCKPIT}"
-    ["vnc.hulin.pro"]="http://127.0.0.1:${PORT_NOVNC}"
-  )
+    ["vnc.hulin.pro"]="http://127.0.0.1:$PORT_NOVNC"
+)
 
-  for d in "${!MAP[@]}"; do
-    yellow " → 创建反代：$d"
-    create_proxy "$d" "${MAP[$d]}"
+for d in "${!PROXY_MAP[@]}"; do
+    id="$(proxy_id_by_domain "$d")"
+    if [[ -n "$id" ]]; then
+        green "[SKIP] $d 已存在（ID=$id）"
+        continue
+    fi
+
+    yellow "[创建] $d → ${PROXY_MAP[$d]}"
+    create_proxy "$d" "${PROXY_MAP[$d]}"
     sleep 1
-  done
+done
 
-  green "[OK] 全部反代创建完成"
-fi
 
-###===============================================
-### SSL 申请辅助函数（自动修复黄码）
-###===============================================
-dns_ok() {
-  a=$(dig +short "$1" | head -n1)
-  [[ "$a" == "$SERVER_IP" ]]
+###############################################
+# Step 13：SSL 申请（V4 自愈版本）
+###############################################
+
+green "[Step 13] 自动申请 SSL"
+
+cert_id_by_domain() {
+    curl -s -H "Authorization: Bearer $TOKEN" "$NPM_API/certificates" |
+        jq ".[] | select(.domain_names[]==\"$1\") | .id" | head -n1
 }
 
 issue_cert() {
-  domain="$1"
-  req=$(jq -nc \
+    local domain="$1"
+    local payload
+    payload="$(jq -nc \
         --argjson dn "[\"$domain\"]" \
-        --arg em "$EMAIL" \
-        '{domain_names:$dn, email:$em, provider:"letsencrypt", challenge:"http", agree_tos:true}')
+        --arg em "$ADMIN_EMAIL" '
+    {
+      domain_names: $dn,
+      email: $em,
+      provider: "letsencrypt",
+      challenge: "http",
+      agree_tos: true
+    }'
+    )"
 
-  resp=$(curl -sS -H "$(npm_auth)" -H "Content-Type: application/json" \
-             -X POST "${NPM_API}/certificates" -d "$req" || true)
-
-  resp=$(json_fix "$resp")
-  echo "$resp" | jq -r '.id // empty'
+    curl -s \
+         -H "Authorization: Bearer $TOKEN" \
+         -H "Content-Type: application/json" \
+         -X POST "$NPM_API/certificates" \
+         -d "$payload"
 }
 
 bind_cert() {
-  host_id="$1"
-  cert_id="$2"
+    local pid="$1"
+    local cid="$2"
 
-  req=$(jq -nc \
-        --argjson cid "$cert_id" \
-        '{certificate_id:$cid, ssl_forced:true, http2_support:true, hsts_enabled:false}')
+    local payload
+    payload="$(jq -nc \
+        --argjson cid "$cid" '
+    {
+      certificate_id: $cid,
+      ssl_forced: true,
+      http2_support: true,
+      hsts_enabled: false,
+      hsts_subdomains: false
+    }')"
 
-  curl -sS -H "$(npm_auth)" -H "Content-Type: application/json" \
-      -X PUT "${NPM_API}/nginx/proxy-hosts/${host_id}" -d "$req" >/dev/null 2>&1 || true
+    curl -s \
+         -H "Authorization: Bearer $TOKEN" \
+         -H "Content-Type: application/json" \
+         -X PUT "$NPM_API/nginx/proxy-hosts/$pid" \
+         -d "$payload" >/dev/null 2>&1
 }
 
-###===============================================
-### Step 13 — 自动申请 SSL（含重试）
-###===============================================
-if step 13 "申请 Let’s Encrypt SSL（自动修复）"; then
-  npm_wait_login || yellow "[WARN] 获取 token 失败，但继续 SSL 流程"
 
-  for d in "${DOMAINS_ALL[@]}"; do
+###############################################
+# SSL 申请 + 绑定（每域名自愈 3 次）
+###############################################
+
+for d in "${!PROXY_MAP[@]}"; do
     echo ""
-    echo "▶ 域名：$d"
+    green "[域名] $d"
 
-    if ! dns_ok "$d"; then
-      yellow "  ❌ DNS 未指向 $SERVER_IP，跳过"
-      continue
+    pid="$(proxy_id_by_domain "$d")"
+    if [[ -z "$pid" ]]; then
+        yellow "  ⚠ 未找到 proxy host，跳过"
+        continue
     fi
 
-    hid=$(get_proxy_id "$d" | tr -d '\n')
-    if [[ -z "$hid" || "$hid" == "null" ]]; then
-      yellow "  ❌ 未找到 Proxy Host"
-      continue
+    cid="$(cert_id_by_domain "$d")"
+    if [[ -n "$cid" ]]; then
+        green "  [SKIP] 已有证书 (ID=$cid)"
+        bind_cert "$pid" "$cid"
+        continue
     fi
 
-    cid=""
-    for retry in 1 2 3 4; do
-      cid=$(issue_cert "$d")
-      if [[ -n "$cid" && "$cid" != "null" ]]; then
-        green "  SSL 申请成功：ID=$cid"
-        break
-      fi
-      yellow "  证书申请失败（第 $retry 次），等待 25 秒重试…"
-      sleep 25
+    yellow "  [申请新证书] ($d)"
+
+    attempts=0
+    while (( attempts < 3 )); do
+        Resp="$(issue_cert "$d")"
+        cid="$(echo "$Resp" | jq -r '.id // empty')"
+
+        if [[ -n "$cid" && "$cid" != "null" ]]; then
+            green "  ✔ 成功：新证书 ID=$cid"
+            bind_cert "$pid" "$cid"
+            break
+        fi
+
+        attempts=$((attempts+1))
+        yellow "  ✗ 失败，30 秒后重试 ($attempts/3)"
+        sleep 30
     done
 
-    if [[ -z "$cid" || "$cid" == "null" ]]; then
-      red "  ❌ SSL 仍失败（已跳过）"
-      continue
-    fi
+    [[ -z "$cid" ]] && red "  ❌ 证书创建失败：$d"
+done
 
-    bind_cert "$hid" "$cid"
-    green "  SSL 已绑定"
-  done
+docker exec npm nginx -s reload || true
+green "[OK] 所有 SSL 已绑定并重载 NPM"
 
-  docker exec npm nginx -s reload || true
-  green "[OK] 所有证书已处理"
-fi
-###===============================================
-### Step 14 — 部署 Portainer（Docker 可视化）
-###===============================================
-if step 14 "部署 Portainer"; then
-  docker volume create portainer_data >/dev/null 2>&1 || true
 
-  docker run -d \
-    --name portainer \
-    --restart always \
-    -p 9443:9443 \
-    -p 8000:8000 \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v portainer_data:/data \
-    portainer/portainer-ce:latest >/dev/null 2>&1 || true
+###############################################
+# Step 14：最终输出
+###############################################
 
-  green "[OK] Portainer 已部署（9443 端口）"
-fi
+echo ""
+green "=================================================="
+green "        🎉 部署完成！GS-PRO Final 已就绪"
+green "=================================================="
 
-###===============================================
-### Step 17 — 结束前检查
-###===============================================
-if step 17 "检查执行状态"; then
-  docker ps -a
-  green "[OK] 所有服务已启动"
-fi
+echo ""
+green " 🌐 访问入口："
+echo "   • 主站：https://$MAIN_DOMAIN"
+echo "   • WordPress 管理：https://wp.$MAIN_DOMAIN/wp-admin"
+echo "   • Nextcloud：https://dri.$MAIN_DOMAIN"
+echo "   • OnlyOffice：https://doc.$MAIN_DOMAIN"
+echo "   • NPM 控制台：https://npm.$MAIN_DOMAIN"
+echo "   • Cockpit：https://coc.$MAIN_DOMAIN"
+echo "   • VNC (noVNC)：https://vnc.$MAIN_DOMAIN"
+echo ""
 
-###===============================================
-### Step 18 — 输出结果信息
-###===============================================
-if step 18 "输出访问信息"; then
+echo "日志文件：$LOG_FILE"
+echo "断点文件：$PROGRESS_FILE"
 
-cat <<EOF
-
-==========================================================
-🎉  GS-PRO VPS 部署完成！
-==========================================================
-
-🌐 主域名入口：
-  https://${MAIN_DOMAIN}
-
-📝 WordPress 多站点后台：
-  https://wp.${MAIN_DOMAIN}/wp-admin/network/
-
-📦 Nextcloud（文件存储）：
-  https://dri.${MAIN_DOMAIN}
-
-📝 OnlyOffice 文档编辑：
-  https://doc.${MAIN_DOMAIN}
-
-🛠 Nginx Proxy Manager 面板：
-  https://npm.${MAIN_DOMAIN}
-
-🖥 Cockpit 系统管理：
-  https://coc.${MAIN_DOMAIN}
-
-🖥 noVNC 浏览器桌面：
-  https://vnc.${MAIN_DOMAIN}
-
-🐳 Portainer（Docker GUI）：
-  https://${SERVER_IP}:9443
-
-🔐 管理账号（NPM / WP 数据库 / Nextcloud DB）：
-  用户名：${NPM_ADMIN_USER}
-  密码：${NPM_ADMIN_PASS}
-
-📁 服务器目录结构：
-  ${ROOT_DIR}/personal
-  ${ROOT_DIR}/glinns
-  ${ROOT_DIR}/gsliberty
-  ${ROOT_DIR}/nextcloud
-  ${ROOT_DIR}/wp
-  ...
-
-📌 断点文件：
-  ${PROGRESS_FILE}
-删除它可重新执行某个步骤。
-
-📌 日志：
-  ${LOG_FILE}
-
-==========================================================
-EOF
-
-fi
-
-###===============================================
-### Step 19 — 完成
-###===============================================
-if step 19 "完成部署"; then
-  green "🚀 所有功能已完成部署！"
-  exit 0
-fi
+green "完成！"
