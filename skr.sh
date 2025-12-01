@@ -1,5 +1,5 @@
 NPM_API="http://127.0.0.1:81/api"
-NPM_USER="admin"
+NPM_USER="Hulin"
 NPM_PASS="Gaomeilan862447#"
 ADMIN_EMAIL="gs@hulin.pro"
 SERVER_IP="$(hostname -I | awk '{print $1}')"
